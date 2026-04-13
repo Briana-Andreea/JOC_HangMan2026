@@ -1,0 +1,13 @@
+programare
+algoritm
+calculator
+retea
+compilator
+variabila
+functie
+structura
+pointer
+recursivitate
+socket
+mancare
+protocol
