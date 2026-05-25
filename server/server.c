@@ -1,4 +1,3 @@
-// server/server.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,254 +8,496 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <time.h>
-#include "../common/protocol.h"
 
-#define MAX_CLIENTS 4
+#define PORT         8080
+#define MAX_PLAYERS  3
+#define MAX_WORD_LEN 64
+#define BUFFER_SIZE  1024
+#define MAX_LIVES    6
+#define MAX_HINTS    3
 
-// ─── Starea globala a jocului ───────────────────────────────────────────────
 typedef struct {
-    char secret_word[MAX_WORD_LEN];
-    int  guessed[26];   // 1 daca litera a-z a fost ghicita corect
-    char wrong[27];
-    int  wrong_count;
+    int  sock;
+    int  lives;
+    int  eliminated;
+    int  active;
+    int  wrong_count;    // greselile individuale
+    char wrong[27];      // literele gresite individual
+    int  hints_used;     // cate indicii a folosit
+} Player;
+
+typedef struct {
+    char secret[MAX_WORD_LEN];
+    char hints[MAX_HINTS][256];  // 3 indicii per cuvant
+    int  guessed[26];            // litere ghicite corect (global)
     int  game_over;
+    int  waiting;
+    int  current_turn;
+    int  player_count;
+    int  winner;
+    Player players[MAX_PLAYERS];
 } Game;
 
 Game game;
-int  client_sockets[MAX_CLIENTS];
-int  client_count = 0;
-pthread_mutex_t game_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t gmux = PTHREAD_MUTEX_INITIALIZER;
 
-// ─── Selecteaza un cuvant aleator ──────────────────────────────────────────
-void load_random_word(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    char words[200][MAX_WORD_LEN];
-    int count = 0;
+// ─── Incarca cuvinte si indicii ───────────────────────────────────────────────
+typedef struct {
+    char word[MAX_WORD_LEN];
+    char hints[MAX_HINTS][256];
+} WordEntry;
 
-    if (f) {
-        while (fscanf(f, "%s", words[count]) == 1 && count < 200)
-            count++;
-        fclose(f);
+WordEntry entries[300];
+int entry_count = 0;
+
+void load_words_and_hints() {
+    // Incarca cuvinte
+    FILE *fw = fopen("cuvinte.txt", "r");
+    char word_list[300][MAX_WORD_LEN];
+    int wcount = 0;
+    if (fw) {
+        while (fscanf(fw, "%s", word_list[wcount]) == 1 && wcount < 300) {
+            for (int i = 0; word_list[wcount][i]; i++)
+                word_list[wcount][i] = tolower(word_list[wcount][i]);
+            wcount++;
+        }
+        fclose(fw);
     }
 
-    // fallback daca fisierul nu exista
-    if (count == 0) {
-        char defaults[][MAX_WORD_LEN] = {
-            "programare","calculator","tastatura","compilator",
-            "algoritm","retea","variabila","functie"
+    // Incarca indicii
+    FILE *fh = fopen("indicii.txt", "r");
+    char hint_map[300][MAX_WORD_LEN];
+    char hint_vals[300][MAX_HINTS][256];
+    int hcount = 0;
+
+    if (fh) {
+        char line[1024];
+        while (fgets(line, sizeof(line), fh) && hcount < 300) {
+            // format: cuvant|indiciu1|indiciu2|indiciu3
+            line[strcspn(line, "\n")] = '\0';
+            char *token = strtok(line, "|");
+            if (!token) continue;
+            strncpy(hint_map[hcount], token, MAX_WORD_LEN-1);
+            for (int i = 0; i < MAX_HINTS; i++) {
+                token = strtok(NULL, "|");
+                if (token)
+                    strncpy(hint_vals[hcount][i], token, 255);
+                else
+                    snprintf(hint_vals[hcount][i], 256,
+                             "Cuvant cu %d litere.", (int)strlen(hint_map[hcount]));
+            }
+            hcount++;
+        }
+        fclose(fh);
+    }
+
+    // Combina
+    entry_count = 0;
+    for (int w = 0; w < wcount; w++) {
+        strcpy(entries[entry_count].word, word_list[w]);
+        // cauta indicii pentru acest cuvant
+        int found = 0;
+        for (int h = 0; h < hcount; h++) {
+            if (strcmp(hint_map[h], word_list[w]) == 0) {
+                for (int i = 0; i < MAX_HINTS; i++)
+                    strcpy(entries[entry_count].hints[i], hint_vals[h][i]);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            // indicii generice
+            snprintf(entries[entry_count].hints[0], 256,
+                     "Cuvant cu %d litere.", (int)strlen(word_list[w]));
+            snprintf(entries[entry_count].hints[1], 256,
+                     "Incepe cu litera '%c'.", word_list[w][0]);
+            snprintf(entries[entry_count].hints[2], 256,
+                     "Se termina cu litera '%c'.",
+                     word_list[w][strlen(word_list[w])-1]);
+        }
+        entry_count++;
+    }
+
+    if (entry_count == 0) {
+        // fallback
+        char def[][MAX_WORD_LEN] = {
+            "programare","algoritm","calculator","retea","compilator"
         };
-        count = 8;
-        memcpy(words, defaults, sizeof(defaults));
+        entry_count = 5;
+        for (int i = 0; i < entry_count; i++) {
+            strcpy(entries[i].word, def[i]);
+            snprintf(entries[i].hints[0], 256, "Cuvant din informatica.");
+            snprintf(entries[i].hints[1], 256, "Are %d litere.", (int)strlen(def[i]));
+            snprintf(entries[i].hints[2], 256, "Incepe cu '%c'.", def[i][0]);
+        }
     }
-
-    srand(time(NULL));
-    strcpy(game.secret_word, words[rand() % count]);
-    // transforma in lowercase
-    for (int i = 0; game.secret_word[i]; i++)
-        game.secret_word[i] = tolower(game.secret_word[i]);
+    printf("[SERVER] %d cuvinte cu indicii incarcate.\n", entry_count);
 }
 
-// ─── Initializeaza jocul ───────────────────────────────────────────────────
 void init_game() {
     memset(game.guessed, 0, sizeof(game.guessed));
-    memset(game.wrong,   0, sizeof(game.wrong));
-    game.wrong_count = 0;
-    game.game_over   = 0;
-    load_random_word("cuvinte.txt");
-    printf("[SERVER] Cuvant ales: %s\n", game.secret_word);
+    game.game_over    = 0;
+    game.waiting      = 1;
+    game.current_turn = 0;
+    game.winner       = -1;
+
+    srand(time(NULL));
+    int idx = rand() % entry_count;
+    strcpy(game.secret, entries[idx].word);
+    for (int i = 0; i < MAX_HINTS; i++)
+        strcpy(game.hints[i], entries[idx].hints[i]);
+
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        game.players[i].lives       = MAX_LIVES;
+        game.players[i].eliminated  = 0;
+        game.players[i].wrong_count = 0;
+        game.players[i].hints_used  = 0;
+        memset(game.players[i].wrong, 0, sizeof(game.players[i].wrong));
+    }
+    printf("[SERVER] Cuvant ales: %s\n", game.secret);
 }
 
-// ─── Construieste afisajul "_ _ a _ _" ────────────────────────────────────
 void build_display(char *out) {
     int pos = 0;
-    for (int i = 0; game.secret_word[i]; i++) {
-        if (game.guessed[game.secret_word[i] - 'a'])
-            out[pos++] = game.secret_word[i];
+    for (int i = 0; game.secret[i]; i++) {
+        char c = game.secret[i];
+        int idx = c - 'a';
+        if (idx >= 0 && idx <= 25 && game.guessed[idx])
+            out[pos++] = c;
         else
             out[pos++] = '_';
         out[pos++] = ' ';
     }
-    if (pos > 0) pos--; // sterge spatiul final
+    if (pos > 0) pos--;
     out[pos] = '\0';
 }
 
-// ─── Verifica daca cuvantul e complet ghicit ───────────────────────────────
 int word_complete() {
-     for (int i = 0; game.secret_word[i] != '\0'; i++) {
-        char c = game.secret_word[i];
-        if (c < 'a' || c > 'z') continue;
-        if (game.guessed[c - 'a'] != 1)
+    for (int i = 0; game.secret[i]; i++) {
+        int idx = game.secret[i] - 'a';
+        if (idx >= 0 && idx <= 25 && !game.guessed[idx])
             return 0;
     }
     return 1;
 }
 
-// ─── Serializeaza GameState -> JSON string ─────────────────────────────────
-void serialize_state(GameState *gs, char *buf) {
-    snprintf(buf, BUFFER_SIZE,
-        "{\"display\":\"%s\",\"wrong\":\"%s\","
-        "\"wrong_count\":%d,\"game_over\":%d,"
-        "\"players\":%d,\"msg\":\"%s\"}",
-        gs->word_display, gs->wrong_letters,
-        gs->wrong_count,  gs->game_over,
-        gs->player_count, gs->message);
+int active_count() {
+    int n = 0;
+    for (int i = 0; i < MAX_PLAYERS; i++)
+        if (game.players[i].active && !game.players[i].eliminated)
+            n++;
+    return n;
 }
 
-// ─── Trimite starea la toti clientii ──────────────────────────────────────
-void broadcast_state(const char *msg) {
-    GameState gs;
-    build_display(gs.word_display);
-    strcpy(gs.wrong_letters, game.wrong);
-    gs.wrong_count  = game.wrong_count;
-    gs.game_over    = game.game_over;
-    gs.player_count = client_count;
-    strncpy(gs.message, msg, 127);
+void advance_turn() {
+    int tries = MAX_PLAYERS;
+    do {
+        game.current_turn = (game.current_turn + 1) % MAX_PLAYERS;
+        tries--;
+    } while (tries > 0 &&
+             (!game.players[game.current_turn].active ||
+              game.players[game.current_turn].eliminated));
+}
 
-    char buf[BUFFER_SIZE];
-    serialize_state(&gs, buf);
-    strcat(buf, "\n"); // delimitator de mesaj
+// ─── Trimite stare ────────────────────────────────────────────────────────────
+void send_state(int pidx, const char *msg) {
+    if (!game.players[pidx].active || game.players[pidx].sock <= 0) return;
 
-    for (int i = 0; i < client_count; i++) {
-        if (client_sockets[i] > 0)
-            send(client_sockets[i], buf, strlen(buf), 0);
+    char disp[MAX_WORD_LEN * 2];
+    build_display(disp);
+
+    // lives_all si wrong_count_all si elim_all per jucator
+    char lives_str[16] = "", wcount_str[16] = "", elim_str[16] = "";
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        char tmp[8];
+        snprintf(tmp, 8, "%d", game.players[i].lives);
+        if (i > 0) { strncat(lives_str,  ",", 15); strncat(wcount_str, ",", 15); strncat(elim_str, ",", 15); }
+        strncat(lives_str, tmp, 15);
+        snprintf(tmp, 8, "%d", game.players[i].wrong_count);
+        strncat(wcount_str, tmp, 15);
+        snprintf(tmp, 4, "%d", game.players[i].eliminated);
+        strncat(elim_str, tmp, 15);
     }
-    printf("[BROADCAST] %s\n", buf);
+
+    // wrong individual al jucatorului cerut
+    char buf[BUFFER_SIZE];
+    snprintf(buf, BUFFER_SIZE,
+        "{\"display\":\"%s\",\"my_wrong\":\"%s\","
+        "\"game_over\":%d,\"players\":%d,\"msg\":\"%s\","
+        "\"turn\":%d,\"my_idx\":%d,\"waiting\":%d,"
+        "\"winner\":%d,\"secret\":\"%s\","
+        "\"lives_all\":\"%s\",\"wcount_all\":\"%s\","
+        "\"elim_all\":\"%s\",\"hints_used\":%d}\n",
+        disp,
+        game.players[pidx].wrong,
+        game.game_over, game.player_count, msg,
+        game.current_turn, pidx, game.waiting,
+        game.winner,
+        (game.game_over > 0) ? game.secret : "",
+        lives_str, wcount_str, elim_str,
+        game.players[pidx].hints_used
+    );
+    send(game.players[pidx].sock, buf, strlen(buf), 0);
 }
 
-// ─── Proceseaza o litera trimisa de un client ──────────────────────────────
-void process_guess(char letter, int client_idx) {
-    pthread_mutex_lock(&game_mutex);
+void broadcast(const char *msg) {
+    for (int i = 0; i < MAX_PLAYERS; i++)
+        if (game.players[i].active)
+            send_state(i, msg);
+}
 
-    if (game.game_over) {
-        pthread_mutex_unlock(&game_mutex);
+// ─── Procesare guess ─────────────────────────────────────────────────────────
+void process_guess(int pidx, char letter) {
+    if (game.game_over || game.waiting) return;
+    if (pidx != game.current_turn) {
+        send_state(pidx, "Nu este randul tau!");
         return;
     }
+    Player *p = &game.players[pidx];
+    if (p->eliminated) { send_state(pidx, "Esti eliminat!"); return; }
 
     letter = tolower(letter);
+    int idx = letter - 'a';
+    if (idx < 0 || idx > 25) return;
+
     char msg[128];
 
-    // deja ghicita?
-    if (game.guessed[letter- 'a'] ||
-        strchr(game.wrong, letter)) {
-        snprintf(msg, 128, "Litera '%c' deja incercata!", letter);
-        broadcast_state(msg);
-        pthread_mutex_unlock(&game_mutex);
+    // litera deja ghicita corect global
+    if (game.guessed[idx]) {
+        snprintf(msg, 128, "Litera '%c' deja ghicita corect!", letter);
+        send_state(pidx, msg);
+        return;
+    }
+    // litera deja incercata de acest jucator
+    if (strchr(p->wrong, letter)) {
+        snprintf(msg, 128, "Ai mai incercat '%c'!", letter);
+        send_state(pidx, msg);
         return;
     }
 
-    // verifica daca e in cuvant
-    if (strchr(game.secret_word, letter)) {
-        game.guessed[letter - 'a'] = 1;
-        snprintf(msg, 128, "Corect! Litera '%c' este in cuvant.", letter);
-        int wc = word_complete();
-	if (wc == 1) {
-	  game.game_over = 1;
-	  snprintf(msg, 128, "Felicitari! Cuvantul era: %s", game.secret_word);
-	}
+    if (strchr(game.secret, letter)) {
+        game.guessed[idx] = 1;
+        snprintf(msg, 128, "Jucator %d: '%c' corect!", pidx+1, letter);
+        if (word_complete()) {
+            game.game_over = 1;
+            game.winner    = pidx;
+            char wm[128];
+            snprintf(wm, 128, "Jucator %d a ghicit: %s! Ceilalti pierd.", pidx+1, game.secret);
+            broadcast(wm);
+            return;
+        }
     } else {
-       int wlen = strlen(game.wrong);
-       if (wlen < 26) {
-	 game.wrong[wlen] = letter;
-	 game.wrong[wlen + 1] = '\0';  // terminator explicit
-       }
-        game.wrong_count++;
-        snprintf(msg, 128, "Gresit! Litera '%c' nu e in cuvant. (%d/6)",
-                 letter, game.wrong_count);
-        if (game.wrong_count >= MAX_WRONG_GUESSES) {
-            game.game_over = 2;
-            snprintf(msg, 128, "Game over! Cuvantul era: %s", game.secret_word);
+        // GRESIT - doar jucatorul curent pierde o viata
+        int wlen = strlen(p->wrong);
+        p->wrong[wlen]   = letter;
+        p->wrong[wlen+1] = '\0';
+        p->wrong_count++;
+        p->lives--;
+
+        snprintf(msg, 128, "Jucator %d: '%c' gresit! Vieti: %d",
+                 pidx+1, letter, p->lives);
+
+        if (p->lives <= 0) {
+            p->eliminated = 1;
+            snprintf(msg, 128, "Jucator %d eliminat!", pidx+1);
+            broadcast(msg);
+            if (active_count() == 0) {
+                game.game_over = 2;
+                char lm[128];
+                snprintf(lm, 128, "Toti eliminati! Cuvantul era: %s", game.secret);
+                broadcast(lm);
+                return;
+            }
+            if (game.current_turn == pidx) advance_turn();
+            broadcast(msg);
+            return;
         }
     }
 
-    broadcast_state(msg);
-    pthread_mutex_unlock(&game_mutex);
+    broadcast(msg);
+    advance_turn();
+    char tm[64];
+    snprintf(tm, 64, "Randul Jucatorului %d!", game.current_turn+1);
+    broadcast(tm);
 }
 
-// ─── Thread per client ─────────────────────────────────────────────────────
-typedef struct { int sock; int idx; } ClientArgs;
+// ─── Procesare cerere indiciu (VARIANTA CU COST DE VIETI) ──────────────────────
+void process_hint(int pidx) {
+    if (game.game_over || game.waiting) return;
+    if (pidx != game.current_turn) {
+        send_state(pidx, "Nu este randul tau pentru indiciu!");
+        return;
+    }
+    Player *p = &game.players[pidx];
+    if (p->hints_used >= MAX_HINTS) {
+        send_state(pidx, "Ai folosit toate indiciile!");
+        return;
+    }
+
+    // --- LOGICA NOUĂ: Cost indiciu (ex: 2 vieți) ---
+    int HINT_COST = 2; 
+    if (p->lives < HINT_COST) {
+        send_state(pidx, "Nu ai destule vieti pentru a cere un indiciu!");
+        return;
+    }
+
+    // Scădem viețile și creștem indiciile folosite
+    p->lives -= HINT_COST;
+    p->wrong_count += HINT_COST; // Pentru ca spanzuratoarea din client sa se deseneze corect
+
+    char msg[300];
+    snprintf(msg, 300, "Indiciu %d: %s",
+             p->hints_used+1, game.hints[p->hints_used]);
+    p->hints_used++;
+
+    // Trimite indiciul doar jucătorului care l-a cerut
+    send_state(pidx, msg);
+
+    // Anunță ceilalți că jucătorul a cerut un indiciu
+    char notif[128];
+    snprintf(notif, 128, "Jucator %d a cerut un indiciu (-%d vieti).", pidx+1, HINT_COST);
+    for (int i = 0; i < MAX_PLAYERS; i++)
+        if (i != pidx && game.players[i].active)
+            send_state(i, notif);
+
+    // Verificăm dacă jucătorul s-a eliminat singur cerând indiciul
+    if (p->lives <= 0) {
+        p->eliminated = 1;
+        char elim_msg[128];
+        snprintf(elim_msg, 128, "Jucator %d s-a eliminat cerand indiciu!", pidx+1);
+        broadcast(elim_msg);
+        
+        if (active_count() == 0) {
+            game.game_over = 2;
+            char lm[128];
+            snprintf(lm, 128, "Toti eliminati! Cuvantul era: %s", game.secret);
+            broadcast(lm);
+            return;
+        }
+        if (game.current_turn == pidx) advance_turn();
+        broadcast(elim_msg);
+        return;
+    }
+
+    // Dacă nu s-a eliminat, starea actualizată (cu mai puține vieți) va fi trimisă oricum prin broadcast-ul de la final de tură dacă schimbi tura, 
+    // sau poți face un broadcast simplu aici ca să vadă toți noile vieți:
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (i != pidx && game.players[i].active) {
+            char notif_lives[128];
+            snprintf(notif_lives, 128, "Jucator %d a cerut un indiciu (-%d vieti).", pidx+1, HINT_COST);
+            send_state(i, notif_lives);
+        }
+    }
+    
+    // Iar pentru TINE, re-trimitem starea cu indiciul ca să fim siguri că rămâne fixat pe ecran
+    send_state(pidx, msg);
+}
+
+
+// ─── Thread client ────────────────────────────────────────────────────────────
+typedef struct { int sock; int idx; } CArgs;
 
 void *handle_client(void *arg) {
-    ClientArgs *ca = (ClientArgs *)arg;
-    int sock = ca->sock;
-    int idx  = ca->idx;
+    CArgs *ca = (CArgs*)arg;
+    int sock = ca->sock, idx = ca->idx;
     free(ca);
-
     char buf[BUFFER_SIZE];
 
-    // trimite starea initiala la noul client
-    pthread_mutex_lock(&game_mutex);
-    broadcast_state("Jucator nou conectat! Ghiceste litera.");
-    pthread_mutex_unlock(&game_mutex);
+    pthread_mutex_lock(&gmux);
+    char jm[128];
+    snprintf(jm, 128, "Jucator %d conectat! %s", idx+1,
+             game.player_count < 2 ? "Asteptam inca un jucator..." : "Gata!");
+    broadcast(jm);
+    if (game.player_count >= 2 && game.waiting) {
+        game.waiting      = 0;
+        game.current_turn = 0;
+        while (!game.players[game.current_turn].active)
+            game.current_turn = (game.current_turn+1) % MAX_PLAYERS;
+        char sm[64];
+        snprintf(sm, 64, "Joc inceput! Randul Jucatorului %d!", game.current_turn+1);
+        broadcast(sm);
+    }
+    pthread_mutex_unlock(&gmux);
 
     while (1) {
-        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        int n = recv(sock, buf, sizeof(buf)-1, 0);
         if (n <= 0) break;
         buf[n] = '\0';
 
-        // parsare simpla: {"letter":"a"}
         char *p = strstr(buf, "\"letter\":\"");
         if (p) {
-            char letter = p[10]; // caracterul dupa "letter":"
-            if (isalpha(letter))
-                process_guess(letter, idx);
+            char letter = p[10];
+            if (isalpha(letter)) {
+                pthread_mutex_lock(&gmux);
+                process_guess(idx, letter);
+                pthread_mutex_unlock(&gmux);
+            }
+        }
+        // cerere indiciu: {"hint":1}
+        if (strstr(buf, "\"hint\":1")) {
+            pthread_mutex_lock(&gmux);
+            process_hint(idx);
+            pthread_mutex_unlock(&gmux);
         }
     }
 
-    printf("[SERVER] Client %d deconectat.\n", idx);
-    pthread_mutex_lock(&game_mutex);
-    client_sockets[idx] = 0;
-    client_count--;
-    pthread_mutex_unlock(&game_mutex);
+    pthread_mutex_lock(&gmux);
+    game.players[idx].active     = 0;
+    game.players[idx].eliminated = 1;
+    game.players[idx].sock       = 0;
+    game.player_count--;
+    if (active_count() == 0 && !game.game_over) game.game_over = 2;
+    else if (game.current_turn == idx && active_count() > 0) advance_turn();
+    broadcast("Un jucator s-a deconectat.");
+    pthread_mutex_unlock(&gmux);
     close(sock);
     return NULL;
 }
 
-// ─── Main ──────────────────────────────────────────────────────────────────
 int main() {
+    load_words_and_hints();
     init_game();
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr = {
-        .sin_family      = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_port        = htons(PORT)
+        .sin_family=AF_INET, .sin_addr.s_addr=INADDR_ANY, .sin_port=htons(PORT)
     };
-
-    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(server_fd, MAX_CLIENTS);
+    bind(sfd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(sfd, MAX_PLAYERS);
     printf("[SERVER] Asculta pe portul %d...\n", PORT);
 
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t len = sizeof(client_addr);
-        int new_sock = accept(server_fd,
-                              (struct sockaddr *)&client_addr, &len);
-        if (new_sock < 0) continue;
+        struct sockaddr_in ca;
+        socklen_t len = sizeof(ca);
+        int nsock = accept(sfd, (struct sockaddr*)&ca, &len);
+        if (nsock < 0) continue;
 
-        pthread_mutex_lock(&game_mutex);
-        if (client_count >= MAX_CLIENTS) {
-            send(new_sock, "{\"msg\":\"Server plin\"}\n", 22, 0);
-            close(new_sock);
-            pthread_mutex_unlock(&game_mutex);
+        pthread_mutex_lock(&gmux);
+        if (game.player_count >= MAX_PLAYERS) {
+            send(nsock, "{\"msg\":\"Server plin!\"}\n", 22, 0);
+            close(nsock);
+            pthread_mutex_unlock(&gmux);
             continue;
         }
-        // gaseste un slot liber
         int idx = 0;
-        while (client_sockets[idx] != 0) idx++;
-        client_sockets[idx] = new_sock;
-        client_count++;
-        printf("[SERVER] Client %d conectat: %s\n",
-               idx, inet_ntoa(client_addr.sin_addr));
-        pthread_mutex_unlock(&game_mutex);
+        while (idx < MAX_PLAYERS && game.players[idx].active) idx++;
+        game.players[idx].sock       = nsock;
+        game.players[idx].lives      = MAX_LIVES;
+        game.players[idx].eliminated = 0;
+        game.players[idx].active     = 1;
+        game.players[idx].wrong_count= 0;
+        game.players[idx].hints_used = 0;
+        memset(game.players[idx].wrong, 0, 27);
+        game.player_count++;
+        printf("[SERVER] Jucator %d conectat: %s\n", idx+1, inet_ntoa(ca.sin_addr));
+        pthread_mutex_unlock(&gmux);
 
-        ClientArgs *ca = malloc(sizeof(ClientArgs));
-        ca->sock = new_sock;
-        ca->idx  = idx;
+        CArgs *carg = malloc(sizeof(CArgs));
+        carg->sock = nsock; carg->idx = idx;
         pthread_t t;
-        pthread_create(&t, NULL, handle_client, ca);
+        pthread_create(&t, NULL, handle_client, carg);
         pthread_detach(t);
     }
     return 0;

@@ -1,0 +1,15 @@
+programare|Activitate prin care creezi software|Se face in limbaje precum C, Python sau Java|Rezultatul ei este un program executabil
+algoritm|O serie de pasi pentru rezolvarea unei probleme|Nu depinde de un limbaj de programare anume|Poate fi reprezentat ca pseudocod sau diagrama
+calculator|Dispozitiv electronic de calcul|Are procesor, memorie si unitati de stocare|Fara el nu ai putea rula niciun program
+retea|Leaga mai multe dispozitive intre ele|Poate fi locala (LAN) sau globala (WAN)|Internetul este cel mai mare exemplu
+compilator|Transforma codul sursa in cod masina|Raporteaza erorile de sintaxa din program|GCC este unul dintre cele mai folosite
+variabila|Zona de memorie cu un nume si o valoare|Poate fi de tip int, char, float etc.|Valoarea ei se poate schimba in timpul executiei
+functie|Bloc de cod reutilizabil cu un nume|Poate primi parametri si returna o valoare|In C se declara cu tip, nume si corp
+structura|Tip de date compus din mai multe campuri|Se declara cu cuvantul cheie struct in C|Permite gruparea datelor inrudite
+pointer|Variabila care stocheaza o adresa de memorie|Se declara cu simbolul * in C|Permite accesul direct la memorie
+recursivitate|Tehnica prin care o functie se apeleaza pe sine|Are nevoie de un caz de baza pentru a se opri|Factorialul si Fibonacci sunt exemple clasice
+socket|Punct de comunicare intr-o retea|Permite trimiterea si primirea de date|Se foloseste cu TCP sau UDP
+protocol|Set de reguli pentru comunicarea in retea|TCP asigura livrarea corecta a datelor|HTTP, FTP si SSH sunt exemple
+memorie|Resursa hardware pentru stocarea datelor|RAM este volatila, SSD-ul nu este|Gestionarea ei gresita cauzeaza memory leak
+tastatura|Dispozitiv de intrare cu taste|Are taste alfanumerice si functionale|Folosita pentru a introduce text in calculator
+monitor|Dispozitiv de afisare a imaginilor|Se masoara in diagonala in inch|Poate fi LCD, LED sau OLED

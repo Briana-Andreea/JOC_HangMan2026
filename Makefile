@@ -14,7 +14,7 @@ server: server/server.c common/protocol.h
 	$(CC) $(CFLAGS) server/server.c -o server/server
 
 client: client/client.c common/protocol.h
-	$(CC) $(CFLAGS) client/client.c $(RAYLIB_FLAGS) -o client/client
+	$(CC) $(CFLAGS) client/client.c $(RAYLIB_FLAGS) -lm -o client/client
 
 clean:
 	rm -f server/server client/client
